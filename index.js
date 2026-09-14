@@ -114,8 +114,10 @@ app.post("/verify-telegram-login", async (req, res) => {
         cards: 0,
         name: user.first_name || "Player",
         telegramId: user.id,
+        referralCode: String(user.id),
         createdAt: admin.database.ServerValue.TIMESTAMP,
       });
+      await db.ref(`referralCodes/${String(user.id)}`).set(uid);
     }
 
     const balanceSnapshot = await userRef.child("balance").once("value");
@@ -140,6 +142,109 @@ app.get("/balance", requireAuth, async (req, res) => {
   }
 });
 
+
+// ---------- Profile / referral / history ----------
+app.get("/profile", requireAuth, async (req, res) => {
+  try {
+    const snap = await db.ref(`users/${req.uid}`).once("value");
+    const p = snap.val() || {};
+    res.json({
+      name: p.name || "Player",
+      telegramId: p.telegramId || req.uid.slice(3),
+      referrals: Number(p.referrals || 0),
+      referralCode: p.referralCode || req.uid.slice(3),
+      balance: Number(p.balance || 0)
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not load profile" });
+  }
+});
+
+app.get("/referral", requireAuth, async (req, res) => {
+  try {
+    const snap = await db.ref(`users/${req.uid}`).once("value");
+    const p = snap.val() || {};
+    res.json({ referralCode: p.referralCode || req.uid.slice(3), referrals: Number(p.referrals || 0) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not load referral" });
+  }
+});
+
+app.get("/history", requireAuth, async (req, res) => {
+  try {
+    const snap = await db.ref(`users/${req.uid}/transactions`)
+      .orderByChild("createdAt").limitToLast(50).once("value");
+    const raw = snap.val() || {};
+    const items = Object.entries(raw).map(([id, v]) => ({ id, ...v }))
+      .sort((a,b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+    res.json({ items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not load history" });
+  }
+});
+
+// ---------- Manual money requests ----------
+function validMoneyAmount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 && n <= 1000000 ? Math.round(n * 100) / 100 : null;
+}
+
+app.post("/deposit-request", requireAuth, async (req, res) => {
+  try {
+    const amount = validMoneyAmount(req.body.amount);
+    if (amount === null) return res.status(400).json({ error: "Invalid deposit amount" });
+
+    const requestRef = db.ref("moneyRequests").push();
+    const request = {
+      uid: req.uid,
+      type: "deposit",
+      amount,
+      status: "pending",
+      createdAt: admin.database.ServerValue.TIMESTAMP
+    };
+    await requestRef.set(request);
+    await db.ref(`users/${req.uid}/transactions/${requestRef.key}`).set(request);
+    res.json({ requestId: requestRef.key, status: "pending" });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not create deposit request" });
+  }
+});
+
+app.post("/withdrawal-request", requireAuth, async (req, res) => {
+  try {
+    const amount = validMoneyAmount(req.body.amount);
+    if (amount === null) return res.status(400).json({ error: "Invalid withdrawal amount" });
+
+    const balanceRef = db.ref(`users/${req.uid}/balance`);
+    const tx = await balanceRef.transaction(current => {
+      const balance = toFiniteNumber(current);
+      if (balance === null || balance < amount) return;
+      return balance - amount;
+    });
+    if (!tx.committed) return res.status(412).json({ error: "Insufficient balance" });
+
+    const requestRef = db.ref("moneyRequests").push();
+    const request = {
+      uid: req.uid,
+      type: "withdrawal",
+      amount,
+      status: "pending",
+      createdAt: admin.database.ServerValue.TIMESTAMP
+    };
+    await requestRef.set(request);
+    await db.ref(`users/${req.uid}/transactions/${requestRef.key}`).set(request);
+    const balance = Number(tx.snapshot.val() || 0);
+    res.json({ requestId: requestRef.key, status: "pending", balance });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not create withdrawal request" });
+  }
+});
+
 app.post("/join-room", requireAuth, async (req, res) => {
   try {
     const uid = req.uid;
@@ -147,7 +252,7 @@ app.post("/join-room", requireAuth, async (req, res) => {
     const parsedStake = toPositiveInteger(stake);
     const parsedCartelaNumber = toPositiveInteger(cartelaNumber);
     if (parsedStake === null) return res.status(400).json({ error: "Invalid room stake" });
-    if (parsedCartelaNumber === null || parsedCartelaNumber > 100) return res.status(400).json({ error: "Invalid cartela number" });
+    if (parsedCartelaNumber === null || parsedCartelaNumber > 500) return res.status(400).json({ error: "Invalid cartela number" });
 
     const roomId = `stake_${parsedStake}_open`;
     const roomRef = db.ref(`rooms/${roomId}`);
@@ -237,6 +342,77 @@ app.post("/claim-bingo", requireAuth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+
+// ---------- Admin money-request controls ----------
+function getAdminUids() {
+  return String(process.env.ADMIN_UIDS || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+}
+async function requireAdmin(req, res, next) {
+  try {
+    await requireAuth(req, res, async () => {
+      if (!getAdminUids().includes(req.uid)) return res.status(403).json({ error: "Admin access required" });
+      next();
+    });
+  } catch (e) {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+}
+
+app.get("/admin/money-requests", requireAdmin, async (req, res) => {
+  try {
+    const snap = await db.ref("moneyRequests").orderByChild("createdAt").limitToLast(100).once("value");
+    const raw = snap.val() || {};
+    const items = Object.entries(raw).map(([id, v]) => ({ id, ...v }))
+      .sort((a,b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+    res.json({ items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not load requests" });
+  }
+});
+
+async function setMoneyRequestStatus(req, res, type, status) {
+  try {
+    const id = String(req.params.id || "");
+    const ref = db.ref(`moneyRequests/${id}`);
+    const snap = await ref.once("value");
+    const r = snap.val();
+    if (!r) return res.status(404).json({ error: "Request not found" });
+    if (r.type !== type) return res.status(400).json({ error: "Wrong request type" });
+    if (r.status !== "pending") return res.status(409).json({ error: "Request already processed" });
+
+    if (type === "deposit" && status === "approved") {
+      await db.ref(`users/${r.uid}/balance`).transaction(v => (toFiniteNumber(v) || 0) + Number(r.amount));
+    }
+    if (type === "withdrawal" && status === "rejected") {
+      await db.ref(`users/${r.uid}/balance`).transaction(v => (toFiniteNumber(v) || 0) + Number(r.amount));
+    }
+
+    await ref.update({
+      status,
+      processedAt: admin.database.ServerValue.TIMESTAMP,
+      processedBy: req.uid
+    });
+    await db.ref(`users/${r.uid}/transactions/${id}`).update({
+      status,
+      processedAt: admin.database.ServerValue.TIMESTAMP,
+      processedBy: req.uid
+    });
+
+    const balanceSnap = await db.ref(`users/${r.uid}/balance`).once("value");
+    res.json({ ok: true, status, balance: Number(balanceSnap.val() || 0) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not process request" });
+  }
+}
+
+app.post("/admin/deposit/:id/approve", requireAdmin, (req,res) => setMoneyRequestStatus(req,res,"deposit","approved"));
+app.post("/admin/deposit/:id/reject", requireAdmin, (req,res) => setMoneyRequestStatus(req,res,"deposit","rejected"));
+app.post("/admin/withdrawal/:id/approve", requireAdmin, (req,res) => setMoneyRequestStatus(req,res,"withdrawal","approved"));
+app.post("/admin/withdrawal/:id/reject", requireAdmin, (req,res) => setMoneyRequestStatus(req,res,"withdrawal","rejected"));
 
 async function advanceAllRooms() {
   try {
